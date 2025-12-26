@@ -1,0 +1,136 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # Run every Sunday at 00:00 UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+    inputs:
+      create_pr:
+        description: 'Create PR for sync'
+        required: false
+        default: 'true'
+
+jobs:
+  sync:
+    name: Sync with Upstream
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/navidrome/navidrome.git || true
+          git fetch upstream master
+
+      - name: Check for new commits
+        id: check
+        run: |
+          BEHIND=$(git rev-list --count develop..upstream/master)
+          echo "commits_behind=$BEHIND" >> $GITHUB_OUTPUT
+          if [ "$BEHIND" -gt 0 ]; then
+            echo "needs_sync=true" >> $GITHUB_OUTPUT
+            echo "Found $BEHIND commits to sync from upstream"
+          else
+            echo "needs_sync=false" >> $GITHUB_OUTPUT
+            echo "Already up to date with upstream"
+          fi
+
+      - name: Get upstream changes summary
+        if: steps.check.outputs.needs_sync == 'true'
+        id: changes
+        run: |
+          SUMMARY=$(git log --oneline develop..upstream/master | head -20)
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          echo "$SUMMARY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create sync branch
+        if: steps.check.outputs.needs_sync == 'true'
+        run: |
+          BRANCH_NAME="sync/upstream-$(date +%Y%m%d)"
+          git checkout -b $BRANCH_NAME upstream/master
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_ENV
+
+      - name: Try to merge develop
+        if: steps.check.outputs.needs_sync == 'true'
+        id: merge
+        run: |
+          # Try to merge develop into the sync branch
+          if git merge develop --no-edit; then
+            echo "merge_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "merge_success=false" >> $GITHUB_OUTPUT
+            git merge --abort
+          fi
+
+      - name: Push sync branch
+        if: steps.check.outputs.needs_sync == 'true' && steps.merge.outputs.merge_success == 'true'
+        run: |
+          git push origin ${{ env.branch_name }}
+
+      - name: Create Pull Request
+        if: steps.check.outputs.needs_sync == 'true' && steps.merge.outputs.merge_success == 'true' && github.event.inputs.create_pr != 'false'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ env.branch_name }}
+          base: develop
+          title: "chore: sync with upstream navidrome"
+          body: |
+            ## Upstream Sync
+
+            This PR syncs our fork with the latest changes from upstream navidrome/navidrome.
+
+            **Commits behind:** ${{ steps.check.outputs.commits_behind }}
+
+            ### Recent upstream changes:
+            ```
+            ${{ steps.changes.outputs.summary }}
+            ```
+
+            ### Checklist:
+            - [ ] Review changes for conflicts with fork features
+            - [ ] Run full test suite
+            - [ ] Update FORK_DIVERGENCE_TRACKER.md if needed
+          labels: |
+            upstream-sync
+            automated
+
+      - name: Notify on merge conflict
+        if: steps.check.outputs.needs_sync == 'true' && steps.merge.outputs.merge_success == 'false'
+        run: |
+          echo "::warning::Merge conflict detected when syncing with upstream!"
+          echo "Manual resolution required."
+          echo ""
+          echo "To resolve:"
+          echo "1. git fetch upstream master"
+          echo "2. git checkout -b sync/upstream-manual upstream/master"
+          echo "3. git merge develop"
+          echo "4. Resolve conflicts"
+          echo "5. git push origin sync/upstream-manual"
+          echo "6. Create PR manually"
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.check.outputs.needs_sync }}" == "true" ]; then
+            if [ "${{ steps.merge.outputs.merge_success }}" == "true" ]; then
+              echo "✅ Successfully created sync PR"
+            else
+              echo "⚠️ Merge conflict - manual resolution required"
+            fi
+          else
+            echo "✅ Already up to date with upstream"
+          fi
